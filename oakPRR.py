@@ -4,17 +4,25 @@ Created on Mar 25, 2021
 @author: rik, sdoran
 '''
 
+from collections import defaultdict
+import csv
 import datetime
-
 import json
+import math
 import os
 import pytz
 import re
 import sqlite3 as sqlite
+import sys
+
+## CONSTANTS
 
 # NextRequestAPIV2 dateTime format
 # 2013-06-12T00:00:00.000-07:00
 NRDTformat = '%Y-%m-%dT%H:%M:%S.%f%z'
+
+CSVDTFormat2 = '%m/%d/%y %H:%M'
+# 2/17/16 0:00
 
 OaklandTimeZone = pytz.timezone('America/Los_Angeles')
 
@@ -32,12 +40,28 @@ PRRdb_fields = {
 		'visibility':  'TEXT',
 		'closure_reasons':  'TEXT',
 		'prr_state':  'TEXT',
+		'initial_contact_date': 'TEXT',
+		'initial_contact_event_id': 'INTEGER',
+
+		# compliance	None
+		# initial_due_date	None
+		
 		'poc_id':  'INTEGER',
+		
 		# 'expiration_date':  'TEXT',
 		# 'account_id':  'INTEGER', 210331: 90 for Oakland
 		# 'anticipated_fulfilled_at':  'TEXT',
+		
+		# demo	False
+		# jlarc_response_biz_days	None
+		# biz_days_to_close	None
+		# days_to_close	None
+		
 		'general_report_response_days':  'INTEGER',
-		'ever_overdue':  'BOOLEAN'
+		'ever_overdue':  'BOOLEAN',
+
+		# bdp_used	False
+		
 		},
 
 	'event': {
@@ -62,6 +86,8 @@ PRRdb_fields = {
 		'updated_at':  'TEXT',
 		'request_id':  'INTEGER',
 		'email':  'BOOLEAN',
+		'deleted':  'BOOLEAN',	
+		'user_id':  'INTEGER',	
 		'note_state':  'TEXT',
 		# 'account_id':  'INTEGER' 210331: 90 for Oakland
 		},
@@ -79,6 +105,18 @@ PRRdb_fields = {
 		'link':  'BOOLEAN',
 		'requester_upload':  'BOOLEAN',
 		'document_state':  'TEXT',
+		
+		# archived	False
+		# expiration_date	None
+		# exempt_from_retention	False
+		# subfolder	
+		# token	None
+		# token_expires_at	None
+		# demo	False
+		# temp_upload_key	None
+		# attachment_via_email	False
+		# original_doc_link	None
+
 		'filename':  'TEXT',
 		'request_id':  'INTEGER',
 		'review_state':  'TEXT',
@@ -126,6 +164,25 @@ PRRdb_fields = {
 	}
 	
 }
+
+## UTILITIES
+
+def basicStats(l):
+	"Returns avg and stdev"
+	if len(l) == 0:
+		return(0.,0.)
+
+	tot = 0
+	for n in l:
+		tot += n
+	avg = float(tot) / len(l)
+
+	sumDiffSq = 0.
+	for n in l:
+		sumDiffSq += (n-avg)*(n-avg)
+
+	stdev = math.sqrt(sumDiffSq) / float(len(l))
+	return (avg,stdev)
 
 def initPRRdb(currDB):
 
@@ -204,7 +261,7 @@ def bldPRRdb(jsonDir,startDate=None,endDate=None):
 		if startDate != None and minDate < startDate:
 			nolder += 1
 			continue
-		if endDate != None and maxDate > endDate:
+		if endDate != None and maxDate >= endDate:
 			nrecent += 1
 			continue
 		
@@ -289,6 +346,7 @@ def bldPRRdb(jsonDir,startDate=None,endDate=None):
 	nskip = 0
 	nmissReq = 0
 	nnew = 0
+	missPRR = []
 	cursor.execute('begin')
 	for document in documentList:
 		if 'request_id' not in document:
@@ -297,7 +355,16 @@ def bldPRRdb(jsonDir,startDate=None,endDate=None):
 			continue
 		
 		reqid = document['request_id']
-		if reqid not in reqid2dbidx:
+		
+		# 210415: check for docs without attending PRR; maintain these in DB
+		noPRR = False
+		try:
+			reqidInt = int(reqid)
+		except:
+			missPRR.append(document['id'])
+			noPRR = True
+		
+		if reqid not in reqid2dbidx and not noPRR:
 			nskip += 1
 			continue
 		
@@ -310,6 +377,8 @@ def bldPRRdb(jsonDir,startDate=None,endDate=None):
 		flds = ','.join(fldList)
 		qms = ','.join(len(fldList)*'?')
 		sql = 'insert into document (%s) values (%s)' % (flds,qms)
+
+		# 210415: 2do: focus only on state=PUBLIC documents?
 
 		valList = [document[f] if f != 'document_state' else document['state'] for f in fldList]
 		
@@ -325,7 +394,14 @@ def bldPRRdb(jsonDir,startDate=None,endDate=None):
 	cmd = 'select count(*) from document'
 	cursor.execute(cmd)
 	ndoc = cursor.fetchone()[0]
-	print(f'bldPRRdb: Document done NDoc={ndoc} nskip={nskip} documentIdx={documentIdx}')
+	print(f'bldPRRdb: Document done NDoc={ndoc} nskip={nskip} documentIdx={documentIdx} NDoc w/o PRR={len(missPRR)}')
+
+	outf = jsonDir + 'docID-missPRR.csv'
+	outs = open(outf,'w')
+	outs.write('docID\n')
+	for docID in missPRR:
+		outs.write(f'{docID}\n')
+	outs.close()
 		
 	## attach NOTES related newer PRR
 	jfile = jsonDir+'notes.json'
@@ -407,9 +483,15 @@ def bldPRRdb(jsonDir,startDate=None,endDate=None):
 	nnew = 0
 	cursor.execute('begin')
 	for depreq in depreqList:
+		
 		if 'request_id' not in depreq:
 			# print('huh')
 			nmissReq += 1
+			continue
+
+		# 210415: Only consider depreq with deleted=false
+		if depreq['deleted'] == True:
+			nskip += 1
 			continue
 		
 		reqid = depreq['request_id']
@@ -542,6 +624,101 @@ def bldPRRdb(jsonDir,startDate=None,endDate=None):
 	nnmsg = cursor.fetchone()[0]
 	print(f'bldPRRdb: notetemp done NNoteMsg={nnmsg} notetempIdx={notetempIdx}')
 
+def bldIndexTblCSV(inf,startDate=None,endDate=None):
+	'''210416:  return prrIDTbl ONLY 
+				make consistent with bldPRRdb
+	'''
+
+	prrTbl = {}
+	statusTbl = defaultdict(int)
+	reqCoTbl = defaultdict(list)
+	ncloseDate = 0
+	nolder = 0
+	nrecent = 0
+	nmultDept = 0
+	nmissDept = 0
+	deptSepChar = b'\xef\xbf\xbd' # only used in Finance
+	FinanceEmChar = '�'
+	EmChar = '—'
+	
+	reader = csv.DictReader(open(inf,encoding = "utf8",errors='replace'))
+	for i,entry in enumerate(reader):
+		prr = {}
+		prrID = entry['Id']
+		prr['id'] = prrID
+
+		createDateStr = entry['Created At'].strip()
+		if createDateStr == '':
+			createDate = None
+		else:
+			createDate = datetime.datetime.strptime(createDateStr,CSVDTFormat2)
+			createDate = createDate.replace(tzinfo=OaklandTimeZone)
+			
+		prr['createDate'] = createDate
+		
+		reqDateStr = entry['Request Date'].strip()
+		if reqDateStr == '':
+			reqdate = None
+		else:
+			reqdate = datetime.datetime.strptime(reqDateStr,CSVDTFormat2)
+			reqdate = reqdate.replace(tzinfo=OaklandTimeZone)
+		
+		minDate = min(createDate,reqdate)
+		maxDate = max(createDate,reqdate)
+		if startDate != None and minDate < startDate:
+			nolder += 1
+			continue
+		if endDate != None and maxDate >= endDate:
+			nrecent += 1
+			continue
+		
+		deptStr = entry['Departments'].strip()
+		# NB: multiple department separated by semi-colon
+		if deptStr.find(';') == -1:
+			if deptStr == '':
+				deptList = []
+				nmissDept += 1
+			else:
+				deptList = [deptStr]
+		else:
+			nmultDept += 1
+			deptList = [dept.strip() for dept in deptStr.split(';')]
+		
+		# Normalize department names	
+		deptList2 = []
+		for dept in deptList:
+			dept = dept.replace(FinanceEmChar,EmChar)
+			ndept = normalizeDeptName(dept)
+			if ndept != '':
+				deptList2.append(ndept)
+		prr['dept'] = deptList2
+			
+		closeDateStr = entry['Closed Date'].strip()
+		prr['closeDate'] = datetime.datetime.strptime(closeDateStr,CSVDTFormat2)  if closeDateStr != '' else None
+		prr['status'] = entry['Status'].strip()
+		prr['text'] = entry['Request Text'].strip()
+		prr['closeReason'] = entry['Closure Reasons'].strip()
+		prr['URL'] = entry['URL'].strip()
+		prr['requestCo'] = entry['Requester Company'].strip()
+		
+		if prr['requestCo'] in ("","N/A","n/a","NA","None","none"):
+			prr['requestCo'] = None
+		else:
+			reqCoTbl[ prr['requestCo'] ].append(prrID)
+		
+		statusTbl[ prr['status'] ] += 1
+		if prr['closeDate'] != None:
+			ncloseDate += 1
+						
+		prrTbl[prrID] = prr
+		
+	print('bldIndexTblCSV: NPRR=%d NMissDept=%d NMultDept=%d NCloseDate=%d' % \
+		(len(prrTbl),nmissDept,nmultDept,ncloseDate))
+	if startDate != None:
+		print(f'bldIndexTblCSV: NOld={nolder} NRecent={nrecent}')
+	
+	return prrTbl
+		
 def loadDept_SD(inf):
 	'''load SD's curated department list
 	deptTbl: name -> {deptID,normName,desc,poc_id}
@@ -572,15 +749,228 @@ def normalizeDeptName(dept):
 	
 	return ndept
 
+def anlyzRedact(currDB,outdir):
+	'''evaluate redaction: contrast CLOSED PRR w/ documents with/out "redaction" in title
+	'''
+
+	curs = currDB.cursor()
+	cmd = 'select id,pretty_id,request_date,created_at,closed_date,closure_reasons,prr_state from prr'
+	curs.execute(cmd)
+	allPRR = curs.fetchall()
+
+	print(f'anlyzRedact: NPRR={len(allPRR)}')
+
+	deptTbl = {} # deptNormName -> year {info}
+	
+	nmissdept = 0
+	nmissRedactPRR = 0
+	allYears = [2018,2019,2020]
+	
+	allCloseReason = set()
+	for prr in allPRR:
+		(prrIdx,pretty_id,request_date,created_at,closed_date,closure_reasons,prr_state) = prr
+		reqDate = datetime.datetime.strptime(request_date,NRDTformat)
+
+		prrYear = reqDate.year
+
+		cmd = 'select department_id from depreq where request_id=?'
+		curs.execute(cmd,(prrIdx,))
+		deptIdx = curs.fetchone()
+		
+		if deptIdx == None:
+			nmissdept += 1
+			continue
+		
+		deptIdx = deptIdx[0]
+
+		cmd = 'select name from department where id=?'
+		curs.execute(cmd,(deptIdx,))
+		deptName = curs.fetchone()
+	
+		if deptName == None:
+			print(f'anlyzDeptClearance: missing deptName deptIdx={deptIdx}?!')
+			nmissdept += 1
+			continue
+		
+		deptName = deptName[0]
+		normDept = normalizeDeptName(deptName)
+
+		if normDept not in deptTbl:
+			deptTbl[normDept] = {}
+			for y in allYears:
+				deptTbl[normDept][y] = {'nprr': 1,'nclose':0, 'ndoc': [], 'fracRedact': [], 'closeDays': [], 'rcloseDays': []}
+		else:
+			deptTbl[normDept][prrYear]['nprr'] += 1
+
+		if prr_state != 'Closed':
+			continue
+		
+		deptTbl[normDept][prrYear]['nclose'] += 1
+
+		if closure_reasons != None and closure_reasons.lower().find('redact') == -1:
+			prrRedact = True
+		else:
+			prrRedact = False
+
+		closeDate = datetime.datetime.strptime(closed_date,NRDTformat)
+		closeDays = (closeDate - reqDate).days
+		
+		cmd = 'select id,title from document where request_id=?'
+		curs.execute(cmd,(prrIdx,))
+		docRows = curs.fetchall()
+		ndoc = len(docRows)
+		deptTbl[normDept][prrYear]['ndoc'].append(ndoc)
+		
+		nredact = 0
+		for doc in docRows:
+			(id,title) = doc
+			if title.lower().find('redact') == -1:
+				nredact += 1
+
+		if nredact>0 and not prrRedact:
+			nmissRedactPRR += 1
+			
+		fracRedact = float(nredact) / ndoc if ndoc>0 else 0.
+		deptTbl[normDept][prrYear]['fracRedact'].append(fracRedact)
+		
+		if nredact>0: # or prrRedact:
+			deptTbl[normDept][prrYear]['rcloseDays'].append(closeDays)
+		else:
+			deptTbl[normDept][prrYear]['closeDays'].append(closeDays)
+
+	print(f'anlyzRedact: NMissRedactPRR={nmissRedactPRR}')
+	
+	allDept = sorted(list(deptTbl.keys()))
+	allCR = sorted(list(allCloseReason))
+	
+	for year in allYears:
+		outf = outdir + f'deptRedact_{year}.csv'
+		outs = open(outf,'w')
+			
+		hdr = 'Dept,NPRR,NClose,AvgNDoc,AvgFracRedact,AvgCloseDay,AvgRedactDay'
+		outs.write(hdr+'\n')
+		for dept in allDept:
+			info = deptTbl[dept][year]
+			avgNDoc,sd = basicStats(info['ndoc'])
+			avgFrac,sd = basicStats(info['fracRedact'])
+			avgCloseDays,sd = basicStats(info['closeDays'])
+			avgRedactDays,sd = basicStats(info['rcloseDays'])
+			line = f'{dept},{info["nprr"]},{info["nclose"]},{avgNDoc},{avgFrac},{avgCloseDays},{avgRedactDays}'
+			outs.write(line+'\n')
+			
+		outs.close()
+
+def compdb2csv(currDB,prrCSVTbl,outf):
+	'''210416: compare 210326 API database against 210322 CSV data
+	'''
+
+	curs = currDB.cursor()
+	cmd = 'select id,pretty_id,request_date,created_at,closed_date,closure_reasons,prr_state from prr'
+	curs.execute(cmd)
+	allPRR = curs.fetchall()
+
+	print(f'compdb2csv: NPRR={len(allPRR)}')
+
+	deptTbl = defaultdict(lambda: defaultdict(lambda: defaultdict(int))) # deptNormName -> year -> ('db' | 'csv') -> freq
+	
+	nmissdept = 0
+	allYears = [2018,2019,2020]
+	
+	fndCSV = set()
+	nmissCSV = 0
+	ndupCSV = 0
+	for prrDB in allPRR:
+		(prrIdx,pretty_id,request_date,created_at,closed_date,closure_reasons,prr_state) = prrDB
+		reqDate = datetime.datetime.strptime(request_date,NRDTformat)
+
+		prrYear = reqDate.year
+
+		cmd = 'select department_id from depreq where request_id=?'
+		curs.execute(cmd,(prrIdx,))
+		
+		# NB: fetching ALL department?!
+		deptIdxList = curs.fetchall()
+		
+		if deptIdxList == None:
+			nmissdept += 1
+			continue
+		
+		deptNameList = []
+		for didx in deptIdxList:
+			deptIdx = didx[0]
+
+			cmd = 'select name from department where id=?'
+			curs.execute(cmd,(deptIdx,))
+			deptName = curs.fetchone()
+		
+			if deptName == None:
+				print(f'compdb2csv: missing deptName deptIdx={deptIdx}?!')
+				nmissdept += 1
+				continue
+			
+			deptName = deptName[0]
+			normDept = normalizeDeptName(deptName)
+			deptNameList.append(normDept)
+	
+			deptTbl[normDept][prrYear]['db'] += 1
+
+		dbDeptSet = set(deptNameList)
+			
+		if pretty_id not in prrCSVTbl:
+			print(f'compdb2csv: missing PRR in CSV? pretty_id={pretty_id}?!')
+			nmissCSV += 1
+			continue
+		
+		if pretty_id in fndCSV:
+			print(f'compdb2csv: dupCSV?! pretty_id={pretty_id}?!')
+			ndupCSV += 1
+			
+		fndCSV.add(pretty_id)
+		prrCSV = prrCSVTbl[pretty_id]
+		for csvDept in prrCSV['dept']:
+			# NB: csv department names normalized in bldIndexTblCSV()
+			deptTbl[csvDept][prrYear]['csv'] += 1
+			
+		csvDeptSet = set(prrCSV['dept'])
+		
+		if dbDeptSet != csvDeptSet:
+			print(f'compdb2csv: different departments?! prrIdx={prrIdx} pretty_id={pretty_id}')
+			dbDeptList = sorted(list(dbDeptSet))
+			csvDeptList = sorted(list(csvDeptSet))
+			print(f'\tDB:  {dbDeptList}')
+			print(f'\tCSV: {csvDeptList}')
+			print('')
+
+	allCSVset = set(prrCSVTbl.keys())
+	dbMissSet = allCSVset - fndCSV
+		
+	print(f'compdb2csv: NMissDept={nmissdept} NMissCSV={nmissCSV} ndupCSV={ndupCSV} NDBMiss={len(dbMissSet)}')
+	
+	allDept = sorted(list(deptTbl.keys()))
+	outs = open(outf,'w')	
+	hdr = 'Dept'
+	for year in allYears:
+		hdr += f',{year}_DB,{year}_CSV'
+	outs.write(hdr+'\n')
+	
+	for dept in allDept:
+		line = f'{dept}'
+		for year in allYears:
+			line += f',{deptTbl[dept][year]["db"]},{deptTbl[dept][year]["csv"]}'
+		outs.write(line+'\n')	
+	
+	outs.close()
+		
 if __name__ == '__main__':
 	
-	dataDir = 'PATH_TO_DATA_DIRECTORY/'
+	dataDir = 'PATH-TO-DATAD/'
 
 	# 210407: Restrict analysis to > Apr 1 2018
 	startDate = datetime.datetime(2018,4,1,tzinfo=OaklandTimeZone)
 	endDate =   datetime.datetime(2021,1,1,tzinfo=OaklandTimeZone)
 	
-	deptFile_SD = dataDir + 'sdoran-DeptLookup-emdash.csv'
+	# 210415: use SD's updated table
+	deptFile_SD = dataDir + 'sdoran-DeptLookup-emdash-v2.csv'
 	global DeptTbl_SD
 	DeptTbl_SD = loadDept_SD(deptFile_SD)
 
@@ -588,3 +978,22 @@ if __name__ == '__main__':
 	jsonDir = dataDir + 'API_data/'
 	
 	bldPRRdb(jsonDir,startDate,endDate)
+
+	sys.exit()
+	
+	dbfile = dataDir +  'prr_210416.db'
+	currDB = sqlite.connect(dbfile)
+
+	# anlyzRedact(currDB,dataDir)
+	
+	## 210416: compare 210326 API data against 210322 CSV data
+	
+	csvFile = dataDir + 'requests-2021-03-22 redacted.csv'
+	prrCSV = bldIndexTblCSV(csvFile,startDate,endDate)
+
+	compFile = dataDir + 'db2csvComp.csv'
+	compdb2csv(currDB,prrCSV,compFile)
+	
+
+
+
